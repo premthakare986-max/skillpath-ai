@@ -1579,24 +1579,29 @@ apiRouter.post('/ai/analyze-profile', requireAuth, async (req: AuthRequest, res)
   }
 });
 
-apiRouter.get('/ai/mentor/context', requireAuth, (req: AuthRequest, res) => {
+apiRouter.get(['/ai/mentor/context', '/mentor/context'], requireAuth, (req: AuthRequest, res) => {
+  console.log(`[Mentor API] Context requested for student ID ${req.user!.id}`);
   try {
     const context = buildMentorStudentContext(req.user!.id);
     return res.json({ success: true, context });
   } catch (err: any) {
-    console.error('Error fetching mentor context:', err);
+    console.error('[Mentor API] Error fetching mentor context:', err?.message || err);
     return res.status(500).json({ error: 'Failed to fetch mentor context.' });
   }
 });
 
-apiRouter.post('/ai/mentor/stream', requireAuth, async (req: AuthRequest, res) => {
+apiRouter.post(['/ai/mentor/stream', '/mentor/stream'], requireAuth, async (req: AuthRequest, res) => {
+  console.log(`[Mentor API] Streaming request received for student ID ${req.user!.id}`);
   try {
     const { message, history } = req.body;
-    if (!message) return res.status(400).json({ error: 'Message is required.' });
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ error: 'Valid message string is required.' });
+    }
 
     res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
 
     await streamCareerMentorAI(
       req.user!.id,
@@ -1610,7 +1615,7 @@ apiRouter.post('/ai/mentor/stream', requireAuth, async (req: AuthRequest, res) =
     res.write('data: [DONE]\n\n');
     res.end();
   } catch (err: any) {
-    console.error('Streaming Mentor Error:', err);
+    console.error('[Mentor API] Streaming Mentor Error:', err?.message || err);
     if (!res.headersSent) {
       return res.status(500).json({ error: 'Streaming error occurred.' });
     }
@@ -1619,15 +1624,18 @@ apiRouter.post('/ai/mentor/stream', requireAuth, async (req: AuthRequest, res) =
   }
 });
 
-apiRouter.post('/ai/mentor', requireAuth, async (req: AuthRequest, res) => {
+apiRouter.post(['/ai/mentor', '/mentor/chat', '/mentor'], requireAuth, async (req: AuthRequest, res) => {
+  console.log(`[Mentor API] Chat request received for student ID ${req.user!.id}`);
   try {
     const { message, history } = req.body;
-    if (!message) return res.status(400).json({ error: 'Message is required.' });
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ error: 'Valid message string is required.' });
+    }
 
     const reply = await askCareerMentorAI(req.user!.id, message, history || []);
-    return res.json({ reply });
+    return res.json({ reply, text: reply, success: true });
   } catch (err: any) {
-    console.error('AI Mentor Error:', err);
+    console.error('[Mentor API] AI Mentor Error:', err?.message || err);
     return res.status(500).json({ error: 'Failed to query career mentor.' });
   }
 });

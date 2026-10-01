@@ -4,23 +4,36 @@ import { calculateSkillGaps } from './engines/skillGapEngine.js';
 import { calculateCareerReadiness } from './engines/careerReadinessEngine.js';
 import { determineNextBestAction } from './engines/nextBestActionEngine.js';
 
-const apiKey = process.env.GEMINI_API_KEY;
-const CANDIDATE_MODELS = [
-  'gemini-3.1-flash-lite',
-  process.env.GEMINI_MODEL || 'gemini-3.8-flash',
-  'gemini-flash-latest'
-].filter((v, i, a) => a.indexOf(v) === i);
-
-let ai: GoogleGenAI | null = null;
-if (apiKey) {
-  ai = new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
+// Dynamic GenAI client retrieval to avoid top-level environment variable evaluation timing issues
+function getGenAI(): { ai: GoogleGenAI | null; apiKey: string | null } {
+  const key = process.env.GEMINI_API_KEY?.trim() || null;
+  if (!key) {
+    return { ai: null, apiKey: null };
+  }
+  return {
+    ai: new GoogleGenAI({
+      apiKey: key,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
       },
-    },
-  });
+    }),
+    apiKey: key
+  };
+}
+
+export function getCandidateModels(): string[] {
+  const configured = process.env.GEMINI_MODEL?.trim();
+  const models = [
+    configured,
+    'gemini-flash-lite-latest',
+    'gemini-3.5-flash-lite',
+    'gemini-3.8-flash',
+    'gemini-3.1-flash-lite',
+    'gemini-flash-latest'
+  ].filter(Boolean) as string[];
+  return Array.from(new Set(models));
 }
 
 /**
@@ -414,10 +427,14 @@ Feel free to paste a specific code snippet or error message, and I'll debug and 
  * Standard conversational response with automatic model fallback
  */
 export async function askCareerMentorAI(userId: number, userMessage: string, history: { role: string; content: string }[] = []) {
+  console.log(`[Mentor API] request received for student ID ${userId}`);
   const context = buildMentorStudentContext(userId);
   const systemInstruction = buildSystemInstruction(context);
 
+  const { ai, apiKey } = getGenAI();
+
   if (!ai || !apiKey) {
+    console.log('[Mentor API] Gemini API key not present, using deterministic technical guidance');
     return generateDeterministicMentorReply(context, userMessage, history);
   }
 
@@ -432,8 +449,10 @@ export async function askCareerMentorAI(userId: number, userMessage: string, his
     }
   ];
 
-  for (const m of CANDIDATE_MODELS) {
+  const models = getCandidateModels();
+  for (const m of models) {
     try {
+      console.log(`[Mentor API] Gemini request started with model: ${m}`);
       const response = await ai.models.generateContent({
         model: m,
         contents: formattedContents,
@@ -444,13 +463,15 @@ export async function askCareerMentorAI(userId: number, userMessage: string, his
       });
 
       if (response.text) {
+        console.log(`[Mentor API] Gemini request completed successfully using ${m}`);
         return response.text;
       }
     } catch (err: any) {
-      console.warn(`Model ${m} encountered error, trying next candidate:`, err?.status || err?.message?.slice(0, 80));
+      console.warn(`[Mentor API] Model ${m} request failed:`, err?.status || err?.message?.slice(0, 80));
     }
   }
 
+  console.log('[Mentor API] All candidate models exhausted or rate-limited; utilizing deterministic guidance');
   return generateDeterministicMentorReply(context, userMessage, history);
 }
 
@@ -463,6 +484,7 @@ export async function streamCareerMentorAI(
   history: { role: string; content: string }[] = [],
   onChunk: (text: string) => void
 ) {
+  console.log(`[Mentor API] Streaming request received for student ID ${userId}`);
   const context = buildMentorStudentContext(userId);
   const systemInstruction = buildSystemInstruction(context);
 
@@ -477,9 +499,13 @@ export async function streamCareerMentorAI(
     }
   ];
 
+  const { ai, apiKey } = getGenAI();
+
   if (ai && apiKey) {
-    for (const m of CANDIDATE_MODELS) {
+    const models = getCandidateModels();
+    for (const m of models) {
       try {
+        console.log(`[Mentor API] Gemini streaming request started with model: ${m}`);
         let streamWorked = false;
         const responseStream = await ai.models.generateContentStream({
           model: m,
@@ -498,15 +524,17 @@ export async function streamCareerMentorAI(
         }
 
         if (streamWorked) {
+          console.log(`[Mentor API] Gemini streaming completed successfully with model: ${m}`);
           return;
         }
       } catch (err: any) {
-        console.warn(`Streaming with model ${m} failed, trying next candidate:`, err?.status || err?.message?.slice(0, 80));
+        console.warn(`[Mentor API] Streaming with model ${m} failed:`, err?.status || err?.message?.slice(0, 80));
       }
     }
   }
 
   // Fallback progressive streaming
+  console.log('[Mentor API] Streaming fallback to deterministic guidance response');
   const fallbackText = generateDeterministicMentorReply(context, userMessage, history);
   const words = fallbackText.split(' ');
   for (let i = 0; i < words.length; i += 4) {
@@ -521,6 +549,7 @@ export async function streamCareerMentorAI(
  */
 export async function analyzeProfileWithAI(userId: number) {
   const context = buildMentorStudentContext(userId);
+  const { ai, apiKey } = getGenAI();
 
   if (!ai || !apiKey) {
     return {
@@ -556,7 +585,8 @@ Return a structured JSON object with keys:
 Student Context:
 ${JSON.stringify(context, null, 2)}`;
 
-  for (const m of CANDIDATE_MODELS) {
+  const models = getCandidateModels();
+  for (const m of models) {
     try {
       const response = await ai.models.generateContent({
         model: m,

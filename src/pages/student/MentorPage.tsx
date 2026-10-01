@@ -11,6 +11,7 @@ import {
 import { useAuth } from '../../context/AuthContext.js';
 import { MarkdownRenderer } from '../../components/mentor/MarkdownRenderer.js';
 import { smoothEase } from '../../components/common/AnimatedWrappers.js';
+import { getApiUrl } from '../../lib/api.js';
 
 interface MentorPageProps {
   onNavigate?: (path: string) => void;
@@ -122,7 +123,7 @@ export const MentorPage: React.FC<MentorPageProps> = ({ onNavigate }) => {
   const loadMentorContext = async () => {
     try {
       setLoadingContext(true);
-      const res = await fetch('/api/ai/mentor/context', { headers: getHeaders() });
+      const res = await fetch(getApiUrl('/api/ai/mentor/context'), { headers: getHeaders() });
       if (res.ok) {
         const data = await res.json();
         setMentorContext(data.context);
@@ -264,7 +265,8 @@ export const MentorPage: React.FC<MentorPageProps> = ({ onNavigate }) => {
         .filter(m => m.id !== 'greeting')
         .map(m => ({ role: m.role, content: m.content }));
 
-      const response = await fetch('/api/ai/mentor/stream', {
+      const streamUrl = getApiUrl('/api/ai/mentor/stream');
+      const response = await fetch(streamUrl, {
         method: 'POST',
         headers: getHeaders(),
         body: JSON.stringify({
@@ -274,8 +276,17 @@ export const MentorPage: React.FC<MentorPageProps> = ({ onNavigate }) => {
         signal: controller.signal
       });
 
+      if (response.status === 401) {
+        throw new Error('AUTH_401');
+      }
+      if (response.status === 403) {
+        throw new Error('AUTH_403');
+      }
+      if (response.status === 429) {
+        throw new Error('RATE_429');
+      }
       if (!response.ok || !response.body) {
-        throw new Error('Streaming connection failed');
+        throw new Error(`STREAM_FAIL_${response.status}`);
       }
 
       const reader = response.body.getReader();
@@ -297,7 +308,9 @@ export const MentorPage: React.FC<MentorPageProps> = ({ onNavigate }) => {
             }
             try {
               const parsed = JSON.parse(dataStr);
-              if (parsed.text) {
+              if (parsed.error) {
+                accumulatedText += `\n\n*(Notice: ${parsed.error})*`;
+              } else if (parsed.text) {
                 accumulatedText += parsed.text;
                 setMessages(prev =>
                   prev.map(m =>
@@ -330,11 +343,36 @@ export const MentorPage: React.FC<MentorPageProps> = ({ onNavigate }) => {
               : m
           )
         );
+      } else if (err.message === 'AUTH_401') {
+        setMessages(prev =>
+          prev.map(m =>
+            m.id === modelMessageId
+              ? { ...m, isStreaming: false, content: 'Your session has expired or you are not logged in. Please log in again to interact with the AI Career Mentor.' }
+              : m
+          )
+        );
+      } else if (err.message === 'AUTH_403') {
+        setMessages(prev =>
+          prev.map(m =>
+            m.id === modelMessageId
+              ? { ...m, isStreaming: false, content: 'Access restricted: You do not have permission to access the AI Career Mentor.' }
+              : m
+          )
+        );
+      } else if (err.message === 'RATE_429') {
+        setMessages(prev =>
+          prev.map(m =>
+            m.id === modelMessageId
+              ? { ...m, isStreaming: false, content: 'The AI Career Mentor is experiencing high traffic (Rate limit reached). Please wait a few moments and try your question again.' }
+              : m
+          )
+        );
       } else {
-        console.error('Mentor Stream Error:', err);
+        console.warn('Mentor Stream connection note, falling back to standard chat API:', err?.message || err);
         // Fallback to standard non-streaming endpoint
         try {
-          const fbRes = await fetch('/api/ai/mentor', {
+          const chatUrl = getApiUrl('/api/ai/mentor');
+          const fbRes = await fetch(chatUrl, {
             method: 'POST',
             headers: getHeaders(),
             body: JSON.stringify({
@@ -342,23 +380,49 @@ export const MentorPage: React.FC<MentorPageProps> = ({ onNavigate }) => {
               history: messages.map(m => ({ role: m.role, content: m.content }))
             })
           });
-          if (fbRes.ok) {
-            const fbData = await fbRes.json();
+
+          const fbData = await fbRes.json().catch(() => null);
+
+          if (fbRes.ok && (fbData?.reply || fbData?.text)) {
             setMessages(prev =>
               prev.map(m =>
                 m.id === modelMessageId
-                  ? { ...m, isStreaming: false, content: fbData.reply }
+                  ? { ...m, isStreaming: false, content: fbData.reply || fbData.text }
+                  : m
+              )
+            );
+          } else if (fbRes.status === 401) {
+            setMessages(prev =>
+              prev.map(m =>
+                m.id === modelMessageId
+                  ? { ...m, isStreaming: false, content: 'Your session has expired or you are not logged in. Please log in again to interact with the AI Career Mentor.' }
+                  : m
+              )
+            );
+          } else if (fbRes.status === 429) {
+            setMessages(prev =>
+              prev.map(m =>
+                m.id === modelMessageId
+                  ? { ...m, isStreaming: false, content: 'The AI Career Mentor is experiencing high traffic (Rate limit 429). Please wait a few seconds and try again.' }
                   : m
               )
             );
           } else {
-            throw new Error('Fallback failed');
+            const errorDetail = fbData?.error || `Server responded with status ${fbRes.status}`;
+            setMessages(prev =>
+              prev.map(m =>
+                m.id === modelMessageId
+                  ? { ...m, isStreaming: false, content: `I encountered an issue connecting to the AI Mentor service (${errorDetail}). Please try again in a moment.` }
+                  : m
+              )
+            );
           }
-        } catch {
+        } catch (netErr: any) {
+          console.error('Mentor fallback error:', netErr);
           setMessages(prev =>
             prev.map(m =>
               m.id === modelMessageId
-                ? { ...m, isStreaming: false, content: 'I encountered an issue connecting to the AI Mentor service. Please check your connection and try again.' }
+                ? { ...m, isStreaming: false, content: 'Unable to reach the AI Mentor service. Please check your network connection and verify the backend is running.' }
                 : m
             )
           );
