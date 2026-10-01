@@ -1,0 +1,116 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (request.auth.token.role == 'admin' ||
+         request.auth.token.email == 'premthakare986@gmail.com');
+    }
+
+    // Public catalog collections (Careers, Master Skills, Public Opportunities)
+    match /careers/{careerId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /skills/{skillId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /resources/{resourceId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /projects/{projectId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /opportunities/{opportunityId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Student user accounts: Strict data isolation
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      // Prevent user from setting or escalating to admin role
+      allow create: if isAuthenticated() &&
+        request.auth.uid == userId &&
+        (!('role' in request.resource.data) || request.resource.data.role != 'admin');
+      allow update: if (isOwner(userId) &&
+        (!('role' in request.resource.data) || request.resource.data.role == resource.data.role)) ||
+        isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // Student Profiles: User can only read and write their own profile
+    match /profiles/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow write: if isOwner(userId) || isAdmin();
+    }
+
+    // Student Sub-collections (Roadmaps, Skills, Projects, DSA, Applications)
+    match /roadmaps/{roadmapId} {
+      allow read, write: if isAuthenticated() &&
+        (resource == null || resource.data.user_id == request.auth.uid || isOwner(resource.data.userId)) ||
+        isAdmin();
+    }
+
+    match /student_skills/{docId} {
+      allow read, write: if isAuthenticated() &&
+        (resource == null || resource.data.user_id == request.auth.uid) ||
+        isAdmin();
+    }
+
+    match /student_projects/{docId} {
+      allow read, write: if isAuthenticated() &&
+        (resource == null || resource.data.user_id == request.auth.uid) ||
+        isAdmin();
+    }
+
+    match /applications/{applicationId} {
+      allow read, write: if isAuthenticated() &&
+        (resource == null || resource.data.user_id == request.auth.uid) ||
+        isAdmin();
+    }
+
+    // Contact Inquiries: Anyone can submit (with validation), but ONLY admins can read, update, or delete
+    match /contact_inquiries/{inquiryId} {
+      allow create: if request.resource.data.full_name is string &&
+                       request.resource.data.full_name.size() >= 2 &&
+                       request.resource.data.email is string &&
+                       request.resource.data.email.matches('.*@.*\\..*') &&
+                       request.resource.data.message is string &&
+                       request.resource.data.message.size() >= 5 &&
+                       (!('status' in request.resource.data) || request.resource.data.status == 'New');
+      allow read, update, delete: if isAdmin();
+    }
+
+    // Admin audit and analytics: Admin only
+    match /admin_audit_logs/{logId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /admin_analytics/{docId} {
+      allow read, write: if isAdmin();
+    }
+
+    // Default deny-all fallback for any unspecified paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
