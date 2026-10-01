@@ -85,6 +85,11 @@ export async function signInWithGoogleFromFirebase(): Promise<GoogleAuthResult> 
     if (code === 'auth/network-request-failed') {
       throw new Error('Network error occurred during Google sign-in. Please check your internet connection.');
     }
+    if (code === 'auth/unauthorized-domain') {
+      throw new Error(
+        'This domain (skillpath-ai-steel.vercel.app) is not authorized in Firebase Console. Go to Firebase Console → Authentication → Settings → Authorized domains, and add "skillpath-ai-steel.vercel.app".'
+      );
+    }
     if (code === 'auth/account-exists-with-different-credential') {
       throw new Error('An account already exists with this email address.');
     }

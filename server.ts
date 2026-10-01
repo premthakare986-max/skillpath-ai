@@ -1,40 +1,22 @@
 import express from 'express';
-import cookieParser from 'cookie-parser';
-import dotenv from 'dotenv';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
-import { initDatabase } from './src/server/db.js';
-import { seedDatabase } from './src/server/seed.js';
-import { authMiddleware } from './src/server/auth.js';
-import { apiRouter } from './src/server/routes.js';
-
-dotenv.config();
+import app from './src/server/app.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const app = express();
 const PORT = 3000;
 const isProduction = process.env.NODE_ENV === 'production';
-
-// Initialize DB and Seed Data
-initDatabase();
-seedDatabase();
-
-app.use(express.json());
-app.use(cookieParser());
-app.use(authMiddleware);
-
-// Mount API routes
-app.use('/api', apiRouter);
-
-// Health check route
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', app: 'SkillPath AI', time: new Date().toISOString() });
-});
+const isVercel = Boolean(process.env.VERCEL);
 
 async function startServer() {
+  if (isVercel) {
+    // On Vercel, requests are handled via serverless functions in api/index.ts
+    return;
+  }
+
   if (!isProduction) {
     // Development mode with Vite middleware
     const { createServer: createViteServer } = await import('vite');
@@ -44,7 +26,7 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    // Production static serving
+    // Production static serving for standalone Node / Cloud Run containers
     const distPath = path.resolve(__dirname, 'dist');
     if (fs.existsSync(distPath)) {
       app.use(express.static(distPath));
@@ -61,7 +43,11 @@ async function startServer() {
   });
 }
 
-startServer().catch(err => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+if (!isVercel) {
+  startServer().catch(err => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}
+
+export default app;

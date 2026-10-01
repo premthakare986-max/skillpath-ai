@@ -3,13 +3,42 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 
-// Ensure data directory exists
-const dataDir = path.resolve(process.cwd(), 'data');
+// ============================================================================
+// DATABASE STORAGE ARCHITECTURE NOTICE:
+// In Vercel's serverless runtime (AWS Lambda), the root project filesystem is
+// read-only (EROFS). The only writable location is '/tmp'.
+// 
+// IMPORTANT: Data stored in '/tmp' is EPHEMERAL and not shared across serverless
+// instances or preserved across cold starts/container recycling.
+// For evaluation and hackathon demos:
+//   1. The bundled seed database ('./data/skillpath.db') is copied to '/tmp' on cold boot.
+//   2. Runtime writes succeed in '/tmp' without throwing read-only filesystem errors.
+//   3. For permanent production persistence, configure an external database
+//      (e.g., PostgreSQL, Supabase, Cloud SQL, Neon, or Turso).
+// ============================================================================
+const isVercel = Boolean(process.env.VERCEL);
+const dataDir = isVercel
+  ? path.resolve('/tmp', 'skillpath-data')
+  : path.resolve(process.cwd(), 'data');
+
 if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
 }
 
 const dbPath = path.join(dataDir, 'skillpath.db');
+
+// If running in Vercel serverless and /tmp does not have the database yet, copy initial pre-seeded database
+if (isVercel && !fs.existsSync(dbPath)) {
+  const sourceDbPath = path.resolve(process.cwd(), 'data', 'skillpath.db');
+  if (fs.existsSync(sourceDbPath)) {
+    try {
+      fs.copyFileSync(sourceDbPath, dbPath);
+    } catch (err) {
+      console.warn('[SkillPath AI] Could not copy initial database to /tmp:', err);
+    }
+  }
+}
+
 const rawDb = new DatabaseSync(dbPath);
 
 // Enable WAL mode & foreign keys for robust concurrency
