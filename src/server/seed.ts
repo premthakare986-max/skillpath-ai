@@ -1,26 +1,33 @@
 import { db, hashPassword } from './db.js';
 import { seedComprehensiveCareersAndSkills } from './seedComprehensiveData.js';
+import { generateAndSaveUserRoadmap } from './engines/roadmapEngine.js';
 
 export function seedDatabase() {
   // Check if admin exists
   const adminEmail = (process.env.ADMIN_EMAIL || 'premthakare986@gmail.com').toLowerCase();
-  const primaryPassword = process.env.ADMIN_PASSWORD || 'prem@rome';
+  
+  // Explicitly ensure the intended admin credentials (prem&rome625) are active
+  const envPassword = process.env.ADMIN_PASSWORD?.trim();
+  const primaryPassword = (envPassword && envPassword !== 'prem@rome625' && envPassword !== 'prem@rome')
+    ? envPassword
+    : 'prem&rome625';
+
   const primaryHash = hashPassword(primaryPassword);
-  const fallbackHash = hashPassword('prem@rome');
+  const secondaryHash = hashPassword('prem&rome625');
 
   const existingAdmin = db.prepare('SELECT id FROM users WHERE LOWER(email) = ?').get(adminEmail) as any;
   if (!existingAdmin) {
     db.prepare(`
       INSERT INTO users (email, password_hash, secondary_password_hash, role)
       VALUES (?, ?, ?, 'admin')
-    `).run(adminEmail, primaryHash, fallbackHash);
+    `).run(adminEmail, primaryHash, secondaryHash);
     console.log(`[Seed] Seeded admin account: ${adminEmail}`);
   } else {
     db.prepare(`
       UPDATE users
       SET password_hash = ?, secondary_password_hash = ?, role = 'admin'
       WHERE id = ?
-    `).run(primaryHash, fallbackHash, existingAdmin.id);
+    `).run(primaryHash, secondaryHash, existingAdmin.id);
   }
 
   // Check if careers exist
@@ -689,12 +696,41 @@ export function seedDatabase() {
     insertNotif.run(demoUserId, 'Welcome to SkillPath AI', 'Your personalized career path for Full Stack Developer has been initialized.', 'info');
     insertNotif.run(demoUserId, 'Next Action Available', 'Strengthen JavaScript fundamentals to unlock React in your roadmap.', 'roadmap');
 
-    // Trigger initial roadmap and recalculation for demo user
-    // We will import and call recalculateStudentState in seed
+    // Trigger initial roadmap for demo user
+    seedDemoUserRoadmap(demoUserId);
   } else {
     demoUserId = existingDemo.id;
+    // Always ensure existing demo user roadmap is verified and populated
+    seedDemoUserRoadmap(demoUserId);
   }
 
   // Ensure all 20 standard careers and 40 skills are always available
   seedComprehensiveCareersAndSkills();
+}
+
+function seedDemoUserRoadmap(demoUserId: number) {
+  try {
+    // Ensure profile has career_goal_id = 1 and onboarding_completed = 1
+    db.prepare(`
+      UPDATE profiles
+      SET career_goal_id = 1, onboarding_completed = 1
+      WHERE user_id = ?
+    `).run(demoUserId);
+
+    let roadmap = db.prepare('SELECT id FROM roadmaps WHERE user_id = ?').get(demoUserId) as { id: number } | undefined;
+    if (!roadmap) {
+      const ins = db.prepare(`
+        INSERT INTO roadmaps (user_id, career_id, title)
+        VALUES (?, 1, 'Full Stack Developer Mastery Roadmap')
+      `).run(demoUserId);
+      roadmap = { id: Number(ins.lastInsertRowid) };
+    }
+
+    const existingCount = db.prepare('SELECT COUNT(*) as cnt FROM roadmap_items WHERE roadmap_id = ?').get(roadmap.id) as { cnt: number };
+    if (existingCount.cnt === 0) {
+      generateAndSaveUserRoadmap(demoUserId, false, 1);
+    }
+  } catch (err) {
+    console.warn('[Seed] Note during demo roadmap check:', err);
+  }
 }

@@ -18,8 +18,15 @@ export function ensureDbInitialized() {
       initDatabase();
       seedDatabase();
       isDbInitialized = true;
-    } catch (err) {
-      console.error('[SkillPath AI] Database initialization warning:', err);
+    } catch (err: any) {
+      console.warn('[SkillPath AI] Initial database bootstrap note:', err?.message || err);
+      try {
+        initDatabase();
+        seedDatabase();
+        isDbInitialized = true;
+      } catch (retryErr: any) {
+        console.error('[SkillPath AI] Database initialization error:', retryErr?.message || retryErr);
+      }
     }
   }
 }

@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import { db, hashPassword, verifyPassword } from './db.js';
 import { AuthRequest, requireAuth, requireAdmin, createSession } from './auth.js';
 import { calculateSkillGaps } from './engines/skillGapEngine.js';
-import { generateOrUpdateRoadmap, computePersonalizedPriorityTopics } from './engines/roadmapEngine.js';
+import { generateOrUpdateRoadmap, getUserRoadmap, generateAndSaveUserRoadmap, updateRoadmapItemStatus, computePersonalizedPriorityTopics } from './engines/roadmapEngine.js';
 import { calculateCareerReadiness } from './engines/careerReadinessEngine.js';
 import { determineNextBestAction } from './engines/nextBestActionEngine.js';
 import { recalculateStudentState } from './engines/aiRecalculationEngine.js';
@@ -54,10 +54,14 @@ apiRouter.post('/auth/register', (req, res) => {
 
     // Create default profile
     const firstCareer = db.prepare('SELECT id FROM careers LIMIT 1').get() as { id: number } | undefined;
+    const defaultCareerId = firstCareer?.id || 1;
     db.prepare(`
       INSERT INTO profiles (user_id, full_name, career_goal_id, onboarding_completed)
       VALUES (?, ?, ?, 0)
-    `).run(userId, cleanName, firstCareer?.id || null);
+    `).run(userId, cleanName, defaultCareerId);
+
+    // Automatically generate personalized roadmap linked to this user's ID
+    generateAndSaveUserRoadmap(userId, false, defaultCareerId);
 
     // Initialize default DSA topics
     const defaultDsa = [
@@ -121,10 +125,27 @@ apiRouter.post('/auth/login', (req, res) => {
     const user = db.prepare('SELECT id, email, password_hash, secondary_password_hash, role FROM users WHERE LOWER(email) = ?').get(cleanEmail) as any;
     
     // Cryptographic scrypt password verification with timing-safe comparison
-    const isPasswordValid = user && (
+    let isPasswordValid = user && (
       (user.password_hash && verifyPassword(password, user.password_hash)) ||
       (user.secondary_password_hash && verifyPassword(password, user.secondary_password_hash))
     );
+
+    // Auto-migrate admin password if existing database had legacy hash and user enters prem&rome625
+    if (user && cleanEmail === 'premthakare986@gmail.com' && !isPasswordValid) {
+      if (password === 'prem&rome625') {
+        const freshHash = hashPassword('prem&rome625');
+        try {
+          db.prepare('UPDATE users SET password_hash = ?, secondary_password_hash = ?, role = ? WHERE id = ?')
+            .run(freshHash, freshHash, 'admin', user.id);
+          user.role = 'admin';
+          user.password_hash = freshHash;
+          isPasswordValid = true;
+          console.log('[Auth] Successfully updated admin credentials to prem&rome625');
+        } catch (updateErr) {
+          console.error('[Auth] Error updating admin password hash:', updateErr);
+        }
+      }
+    }
 
     if (!user || !isPasswordValid) {
       return res.status(401).json({ error: 'Invalid email or password.' });
@@ -230,11 +251,16 @@ apiRouter.post('/auth/google', (req, res) => {
 
       const newUserId = Number(insRes.lastInsertRowid);
 
-      // Create strictly EMPTY profile: 0 skills, 0 roadmap, 0 projects
+      // Create profile with default career_goal_id so roadmap is ready
+      const firstCareer = db.prepare('SELECT id FROM careers LIMIT 1').get() as { id: number } | undefined;
+      const defaultCareerId = firstCareer?.id || 1;
       db.prepare(`
-        INSERT INTO profiles (user_id, full_name, avatar_url, onboarding_completed)
-        VALUES (?, ?, ?, 0)
-      `).run(newUserId, cleanDisplayName, cleanPhotoUrl);
+        INSERT INTO profiles (user_id, full_name, avatar_url, career_goal_id, onboarding_completed)
+        VALUES (?, ?, ?, ?, 0)
+      `).run(newUserId, cleanDisplayName, cleanPhotoUrl, defaultCareerId);
+
+      // Automatically generate personalized roadmap linked to this user's ID
+      generateAndSaveUserRoadmap(newUserId, false, defaultCareerId);
 
       user = {
         id: newUserId,
@@ -624,6 +650,7 @@ apiRouter.post('/onboarding/complete', requireAuth, (req: AuthRequest, res) => {
     }
 
     // 4. Generate initial personalized roadmap & recalculate
+    generateAndSaveUserRoadmap(userId, true, targetCareerId);
     const summary = recalculateStudentState(userId, 'onboarding_completed');
 
     db.prepare(`
@@ -829,59 +856,53 @@ apiRouter.get('/student/gaps', requireAuth, (req: AuthRequest, res) => {
 });
 
 apiRouter.get('/student/roadmap', requireAuth, (req: AuthRequest, res) => {
-  const phases = generateOrUpdateRoadmap(req.user!.id);
-  return res.json({ phases });
+  try {
+    const phases = getUserRoadmap(req.user!.id);
+    return res.json({ phases });
+  } catch (err: any) {
+    console.error('[Roadmap API] Error loading roadmap:', err);
+    return res.status(500).json({ error: 'Failed to load user roadmap.' });
+  }
 });
 
 apiRouter.post('/student/roadmap/item/:itemId/status', requireAuth, (req: AuthRequest, res) => {
-  const userId = req.user!.id;
-  const { status } = req.body;
-  const itemId = req.params.itemId;
+  try {
+    const userId = req.user!.id;
+    const { status } = req.body;
+    const itemId = Number(req.params.itemId);
 
-  if (!['not_started', 'available', 'in_progress', 'completed'].includes(status)) {
-    return res.status(400).json({ error: 'Invalid status.' });
+    if (!['not_started', 'available', 'in_progress', 'completed'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status.' });
+    }
+
+    const result = updateRoadmapItemStatus(userId, itemId, status);
+    if (!result.success) {
+      return res.status(404).json({ error: result.error || 'Roadmap item not found.' });
+    }
+
+    // Trigger Master Recalculation Engine
+    const summary = recalculateStudentState(userId, `roadmap_task_${status}`);
+
+    return res.json({
+      success: true,
+      message: result.message,
+      summary
+    });
+  } catch (err: any) {
+    console.error('[Roadmap API] Error updating item status:', err);
+    return res.status(500).json({ error: 'Failed to update item status.' });
   }
-
-  const item = db.prepare(`
-    SELECT ri.*, s.name as skill_name
-    FROM roadmap_items ri
-    JOIN roadmaps r ON ri.roadmap_id = r.id
-    JOIN skills s ON ri.skill_id = s.id
-    WHERE ri.id = ? AND r.user_id = ?
-  `).get(itemId, userId) as any;
-
-  if (!item) return res.status(404).json({ error: 'Roadmap item not found.' });
-
-  const completedAt = status === 'completed' ? new Date().toISOString() : null;
-
-  db.prepare('UPDATE roadmap_items SET status = ?, completed_at = ? WHERE id = ?').run(status, completedAt, itemId);
-
-  // Sync to student_skills table
-  if (status === 'completed') {
-    db.prepare(`
-      INSERT INTO student_skills (user_id, skill_id, self_proficiency, computed_proficiency, status)
-      VALUES (?, ?, 85, 85, 'completed')
-      ON CONFLICT(user_id, skill_id) DO UPDATE SET
-        computed_proficiency = CASE WHEN computed_proficiency < 80 THEN 85 ELSE computed_proficiency END,
-        status = 'completed',
-        updated_at = CURRENT_TIMESTAMP
-    `).run(userId, item.skill_id);
-  }
-
-  // Trigger Master Recalculation Engine
-  const summary = recalculateStudentState(userId, `roadmap_task_${status}`);
-
-  return res.json({
-    success: true,
-    message: status === 'completed' ? `Milestone Completed: ${item.skill_name}!` : 'Roadmap item status updated.',
-    summary
-  });
 });
 
 apiRouter.post('/student/roadmap/recalculate', requireAuth, (req: AuthRequest, res) => {
-  const summary = recalculateStudentState(req.user!.id, 'manual_recalculate');
-  const phases = generateOrUpdateRoadmap(req.user!.id);
-  return res.json({ success: true, summary, phases });
+  try {
+    const phases = generateAndSaveUserRoadmap(req.user!.id, true);
+    const summary = recalculateStudentState(req.user!.id, 'manual_recalculate');
+    return res.json({ success: true, summary, phases });
+  } catch (err: any) {
+    console.error('[Roadmap API] Error recalculating roadmap:', err);
+    return res.status(500).json({ error: 'Failed to recalculate user roadmap.' });
+  }
 });
 
 apiRouter.get('/student/next-action', requireAuth, (req: AuthRequest, res) => {

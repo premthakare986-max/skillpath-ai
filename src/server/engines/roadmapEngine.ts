@@ -28,125 +28,276 @@ export interface RoadmapItemView {
   hasAssessment: boolean;
 }
 
+/**
+ * Retrieve the authenticated user's existing saved roadmap.
+ * If no roadmap exists or if existing roadmap has 0 items, generates and saves a new one.
+ * Never overwrites an existing user's progress on simple page loads.
+ */
+export function getUserRoadmap(userId: number): RoadmapPhase[] {
+  // 1. Check if user already has a roadmap record
+  const existingRoadmap = db.prepare('SELECT id, career_id, title FROM roadmaps WHERE user_id = ?').get(userId) as {
+    id: number;
+    career_id: number;
+    title: string;
+  } | undefined;
+
+  if (existingRoadmap) {
+    const itemCount = db.prepare('SELECT COUNT(*) as cnt FROM roadmap_items WHERE roadmap_id = ?').get(existingRoadmap.id) as { cnt: number };
+    if (itemCount.cnt > 0) {
+      return loadPhasesFromDatabase(existingRoadmap.id);
+    }
+  }
+
+  // 2. No roadmap or 0 items: Generate, persist, and return
+  return generateAndSaveUserRoadmap(userId, false);
+}
+
+/**
+ * Main compatibility function used across routes and engine handlers.
+ */
 export function generateOrUpdateRoadmap(userId: number, careerId?: number): RoadmapPhase[] {
-  let targetCareerId: number | undefined = careerId;
+  if (careerId) {
+    // If explicit career requested and differs from saved, regenerate for new career
+    const current = db.prepare('SELECT career_id FROM roadmaps WHERE user_id = ?').get(userId) as { career_id: number } | undefined;
+    if (current && current.career_id === careerId) {
+      return getUserRoadmap(userId);
+    }
+    return generateAndSaveUserRoadmap(userId, true, careerId);
+  }
+  return getUserRoadmap(userId);
+}
+
+/**
+ * Generate a personalized roadmap tailored to the student's profile, career goal, academic context,
+ * and current skills. Saves directly into `roadmaps` and `roadmap_items` scoped to `user_id`.
+ */
+export function generateAndSaveUserRoadmap(userId: number, forceRecalculate: boolean = false, overrideCareerId?: number): RoadmapPhase[] {
+  // 1. Resolve Profile & Career
+  const profile = db.prepare('SELECT * FROM profiles WHERE user_id = ?').get(userId) as any;
+  
+  let targetCareerId = overrideCareerId || profile?.career_goal_id;
   if (!targetCareerId) {
-    const profile = db.prepare('SELECT career_goal_id FROM profiles WHERE user_id = ?').get(userId) as { career_goal_id: number } | undefined;
-    targetCareerId = profile?.career_goal_id;
+    const firstCareer = db.prepare('SELECT id FROM careers LIMIT 1').get() as { id: number } | undefined;
+    targetCareerId = firstCareer?.id || 1;
+    // Persist default career goal if not yet set
+    try {
+      db.prepare('UPDATE profiles SET career_goal_id = ? WHERE user_id = ?').run(targetCareerId, userId);
+    } catch {}
   }
 
-  let validCareerId: number;
-  let careerTitle: string;
+  const career = db.prepare('SELECT id, title, slug FROM careers WHERE id = ?').get(targetCareerId) as { id: number; title: string; slug: string } | undefined;
+  const careerTitle = career?.title || 'Full Stack Developer';
+  const validCareerId = career?.id || 1;
 
-  const career = targetCareerId
-    ? (db.prepare('SELECT id, title FROM careers WHERE id = ?').get(targetCareerId) as { id: number; title: string } | undefined)
-    : undefined;
+  // 2. Fetch career skills
+  let careerSkills = db.prepare(`
+    SELECT cs.skill_id, cs.required_level, cs.order_index,
+           s.name as skill_name, s.category, s.difficulty, s.description
+    FROM career_skills cs
+    JOIN skills s ON cs.skill_id = s.id
+    WHERE cs.career_id = ?
+    ORDER BY cs.order_index ASC
+  `).all(validCareerId) as {
+    skill_id: number;
+    required_level: number;
+    order_index: number;
+    skill_name: string;
+    category: string;
+    difficulty: string;
+    description: string;
+  }[];
 
-  if (career) {
-    validCareerId = career.id;
-    careerTitle = career.title;
-  } else {
-    const firstCareer = db.prepare('SELECT id, title FROM careers LIMIT 1').get() as { id: number; title: string } | undefined;
-    if (!firstCareer) return [];
-    validCareerId = firstCareer.id;
-    careerTitle = firstCareer.title;
+  // If this career has no skills attached (e.g., custom or unmapped career), pull foundational standard skills
+  if (careerSkills.length === 0) {
+    careerSkills = db.prepare(`
+      SELECT s.id as skill_id, 80 as required_level, s.id as order_index,
+             s.name as skill_name, s.category, s.difficulty, s.description
+      FROM skills s
+      ORDER BY s.id ASC
+      LIMIT 10
+    `).all() as any[];
   }
 
-  // Check if roadmap record exists
-  let roadmap = db.prepare('SELECT id, career_id FROM roadmaps WHERE user_id = ?').get(userId) as { id: number; career_id: number } | undefined;
+  // 3. Fetch student current skills and completed items (to preserve on recalculate)
+  const studentSkills = db.prepare(`
+    SELECT skill_id, self_proficiency, computed_proficiency, status
+    FROM student_skills
+    WHERE user_id = ?
+  `).all(userId) as {
+    skill_id: number;
+    self_proficiency: number;
+    computed_proficiency: number;
+    status: string;
+  }[];
+  const skillProficiencyMap = new Map(studentSkills.map(s => [s.skill_id, s]));
 
-  if (!roadmap || roadmap.career_id !== validCareerId) {
-    // Delete existing items if switching careers
-    if (roadmap) {
-      db.prepare('DELETE FROM roadmap_items WHERE roadmap_id = ?').run(roadmap.id);
-      db.prepare('DELETE FROM roadmaps WHERE id = ?').run(roadmap.id);
-    }
-
-    const ins = db.prepare(`
-      INSERT INTO roadmaps (user_id, career_id, title)
-      VALUES (?, ?, ?)
-    `).run(userId, validCareerId, `${careerTitle} Mastery Roadmap`);
-    roadmap = { id: Number(ins.lastInsertRowid), career_id: validCareerId };
-
-    // Generate initial items from career skills
-    const careerSkills = db.prepare(`
-      SELECT cs.skill_id, cs.order_index, s.name as skill_name, s.category, s.difficulty, s.description
-      FROM career_skills cs
-      JOIN skills s ON cs.skill_id = s.id
-      WHERE cs.career_id = ?
-      ORDER BY cs.order_index ASC
-    `).all(validCareerId) as {
-      skill_id: number;
-      order_index: number;
-      skill_name: string;
-      category: string;
-      difficulty: string;
-      description: string;
-    }[];
-
-    const insertItem = db.prepare(`
-      INSERT INTO roadmap_items (roadmap_id, phase_number, phase_title, skill_id, title, description, status, estimated_hours, order_index)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    // Group into phases
-    for (const cs of careerSkills) {
-      let phaseNumber = 1;
-      let phaseTitle = 'Phase 1: Foundations & Markup';
-      let estHours = 15;
-
-      if (cs.category === 'Frontend' && (cs.skill_name.includes('HTML') || cs.skill_name.includes('CSS'))) {
-        phaseNumber = 1;
-        phaseTitle = 'Phase 1: Web Fundamentals';
-        estHours = 12;
-      } else if (cs.category === 'Frontend' || cs.category === 'Core CS' && cs.skill_name.includes('Git')) {
-        phaseNumber = 2;
-        phaseTitle = 'Phase 2: Modern Frontend & Scripting';
-        estHours = 25;
-      } else if (cs.category === 'Backend') {
-        phaseNumber = 3;
-        phaseTitle = 'Phase 3: Backend Services & APIs';
-        estHours = 30;
-      } else if (cs.category === 'Database' || cs.skill_name.includes('Security') || cs.skill_name.includes('Auth')) {
-        phaseNumber = 4;
-        phaseTitle = 'Phase 4: Database Systems & Authentication';
-        estHours = 25;
-      } else if (cs.category === 'DevOps') {
-        phaseNumber = 5;
-        phaseTitle = 'Phase 5: Containerization & Deployment';
-        estHours = 20;
-      } else if (cs.category === 'DSA') {
-        phaseNumber = 6;
-        phaseTitle = 'Phase 6: Data Structures & Algorithms Track';
-        estHours = 35;
-      } else {
-        phaseNumber = 7;
-        phaseTitle = 'Phase 7: Advanced Engineering Track';
-        estHours = 30;
+  // Existing completed items to preserve if force recalculating
+  const existingCompletedSkills = new Set<number>();
+  if (forceRecalculate) {
+    const prevRoadmap = db.prepare('SELECT id FROM roadmaps WHERE user_id = ?').get(userId) as { id: number } | undefined;
+    if (prevRoadmap) {
+      const prevItems = db.prepare("SELECT skill_id FROM roadmap_items WHERE roadmap_id = ? AND status = 'completed'").all(prevRoadmap.id) as { skill_id: number }[];
+      for (const pi of prevItems) {
+        existingCompletedSkills.add(pi.skill_id);
       }
-
-      insertItem.run(
-        roadmap.id,
-        phaseNumber,
-        phaseTitle,
-        cs.skill_id,
-        cs.skill_name,
-        cs.description || `Master core principles of ${cs.skill_name} and apply them to real applications.`,
-        'available',
-        estHours,
-        cs.order_index
-      );
     }
   }
 
-  if (!roadmap) {
-    return [];
+  // 4. Calculate Phase Assignment Dynamically
+  // Break into 4 or 5 cohesive engineering phases
+  const totalSkills = careerSkills.length;
+  const numPhases = totalSkills >= 10 ? 5 : Math.max(3, Math.min(4, totalSkills));
+  const itemsPerPhase = Math.ceil(totalSkills / numPhases);
+
+  const phaseTitles = getPhaseTitlesForCareer(careerTitle, numPhases);
+
+  // Group items
+  const itemsToInsert: {
+    phaseNumber: number;
+    phaseTitle: string;
+    skillId: number;
+    title: string;
+    description: string;
+    status: 'locked' | 'available' | 'in_progress' | 'completed';
+    estimatedHours: number;
+    orderIndex: number;
+    completedAt: string | null;
+  }[] = [];
+
+  for (let idx = 0; idx < careerSkills.length; idx++) {
+    const cs = careerSkills[idx];
+    const phaseIndex = Math.min(numPhases - 1, Math.floor(idx / itemsPerPhase));
+    const phaseNumber = phaseIndex + 1;
+    const phaseTitle = phaseTitles[phaseIndex] || `Phase ${phaseNumber}: Milestone Track`;
+
+    // Estimate hours based on difficulty & learning pace
+    let estHours = 18;
+    if (cs.difficulty === 'Beginner') estHours = 12;
+    else if (cs.difficulty === 'Intermediate') estHours = 22;
+    else if (cs.difficulty === 'Advanced') estHours = 32;
+
+    if (profile?.learning_pace === 'intensive') estHours = Math.round(estHours * 0.85);
+    else if (profile?.learning_pace === 'steady') estHours = Math.round(estHours * 1.2);
+
+    // Initial Status Determination
+    const existingSkill = skillProficiencyMap.get(cs.skill_id);
+    let initialStatus: 'locked' | 'available' | 'in_progress' | 'completed' = 'available';
+    let completedAt: string | null = null;
+
+    if (existingCompletedSkills.has(cs.skill_id) || existingSkill?.status === 'completed' || (existingSkill?.computed_proficiency || 0) >= 70) {
+      initialStatus = 'completed';
+      completedAt = new Date().toISOString();
+    } else if (existingSkill && (existingSkill.computed_proficiency > 0 || existingSkill.self_proficiency > 0)) {
+      initialStatus = 'in_progress';
+    } else if (phaseNumber === 1 || idx === 0) {
+      initialStatus = 'available';
+    } else if (phaseNumber === 2 && idx < 4) {
+      initialStatus = 'available';
+    } else {
+      initialStatus = 'locked';
+    }
+
+    itemsToInsert.push({
+      phaseNumber,
+      phaseTitle,
+      skillId: cs.skill_id,
+      title: cs.skill_name,
+      description: cs.description || `Master core principles and industry applications of ${cs.skill_name}.`,
+      status: initialStatus,
+      estimatedHours: estHours,
+      orderIndex: idx + 1,
+      completedAt
+    });
   }
 
-  // Recalculate status of all items based on current student skills & dependencies
-  const gaps = calculateSkillGaps(userId, validCareerId);
-  const gapMap = new Map(gaps.map(g => [g.skillId, g]));
+  // 5. Persist to Database with user isolation
+  const upsertRoadmap = db.prepare(`
+    INSERT INTO roadmaps (user_id, career_id, title, recalculated_at)
+    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(user_id) DO UPDATE SET
+      career_id = excluded.career_id,
+      title = excluded.title,
+      recalculated_at = CURRENT_TIMESTAMP
+  `);
+  upsertRoadmap.run(userId, validCareerId, `${careerTitle} Mastery Roadmap`);
 
+  const userRoadmap = db.prepare('SELECT id FROM roadmaps WHERE user_id = ?').get(userId) as { id: number };
+
+  // Delete previous items for this roadmap to ensure clean state
+  db.prepare('DELETE FROM roadmap_items WHERE roadmap_id = ?').run(userRoadmap.id);
+
+  const insertItem = db.prepare(`
+    INSERT INTO roadmap_items (roadmap_id, phase_number, phase_title, skill_id, title, description, status, estimated_hours, order_index, completed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  for (const it of itemsToInsert) {
+    insertItem.run(
+      userRoadmap.id,
+      it.phaseNumber,
+      it.phaseTitle,
+      it.skillId,
+      it.title,
+      it.description,
+      it.status,
+      it.estimatedHours,
+      it.orderIndex,
+      it.completedAt
+    );
+  }
+
+  // 6. Return grouped phases
+  return loadPhasesFromDatabase(userRoadmap.id);
+}
+
+/**
+ * Update the status of a specific roadmap item belonging to the authenticated user.
+ * Ensures strict cross-user isolation: User A can only update items belonging to their roadmap.
+ */
+export function updateRoadmapItemStatus(userId: number, itemId: number, status: string): { success: boolean; message?: string; error?: string } {
+  const item = db.prepare(`
+    SELECT ri.*, s.name as skill_name, r.id as roadmap_id
+    FROM roadmap_items ri
+    JOIN roadmaps r ON ri.roadmap_id = r.id
+    JOIN skills s ON ri.skill_id = s.id
+    WHERE ri.id = ? AND r.user_id = ?
+  `).get(itemId, userId) as any;
+
+  if (!item) {
+    return { success: false, error: 'Roadmap item not found or unauthorized.' };
+  }
+
+  const completedAt = status === 'completed' ? (item.completed_at || new Date().toISOString()) : null;
+
+  db.prepare('UPDATE roadmap_items SET status = ?, completed_at = ? WHERE id = ?').run(status, completedAt, item.id);
+
+  // If milestone is completed, sync to student_skills
+  if (status === 'completed') {
+    db.prepare(`
+      INSERT INTO student_skills (user_id, skill_id, self_proficiency, computed_proficiency, status)
+      VALUES (?, ?, 85, 85, 'completed')
+      ON CONFLICT(user_id, skill_id) DO UPDATE SET
+        computed_proficiency = CASE WHEN computed_proficiency < 80 THEN 85 ELSE computed_proficiency END,
+        status = 'completed',
+        updated_at = CURRENT_TIMESTAMP
+    `).run(userId, item.skill_id);
+
+    // Automatically unlock next items in subsequent phase if threshold met
+    unlockSubsequentItemsIfReady(item.roadmap_id, item.phase_number);
+  }
+
+  db.prepare('UPDATE roadmaps SET recalculated_at = CURRENT_TIMESTAMP WHERE id = ?').run(item.roadmap_id);
+
+  return {
+    success: true,
+    message: status === 'completed' ? `Milestone Completed: ${item.skill_name}!` : 'Roadmap item status updated.'
+  };
+}
+
+/**
+ * Internal helper to read items from database and format into RoadmapPhase structures.
+ */
+function loadPhasesFromDatabase(roadmapId: number): RoadmapPhase[] {
   const rawItems = db.prepare(`
     SELECT ri.id, ri.roadmap_id, ri.phase_number, ri.phase_title, ri.skill_id, ri.title,
            ri.description, ri.status, ri.estimated_hours, ri.order_index, ri.completed_at,
@@ -157,83 +308,34 @@ export function generateOrUpdateRoadmap(userId: number, careerId?: number): Road
     JOIN skills s ON ri.skill_id = s.id
     WHERE ri.roadmap_id = ?
     ORDER BY ri.phase_number ASC, ri.order_index ASC
-  `).all(roadmap.id) as {
-    id: number;
-    roadmap_id: number;
-    phase_number: number;
-    phase_title: string;
-    skill_id: number;
-    title: string;
-    description: string;
-    status: 'locked' | 'available' | 'in_progress' | 'completed';
-    estimated_hours: number;
-    order_index: number;
-    completed_at: string | null;
-    skill_name: string;
-    resource_count: number;
-    assessment_count: number;
-  }[];
+  `).all(roadmapId) as any[];
 
-  const updateItemStatus = db.prepare('UPDATE roadmap_items SET status = ?, completed_at = ? WHERE id = ?');
-
-  const itemsView: RoadmapItemView[] = [];
-
-  for (const item of rawItems) {
-    const gapInfo = gapMap.get(item.skill_id);
-    let computedStatus = item.status;
-
-    if (gapInfo) {
-      if (gapInfo.status === 'completed' || gapInfo.currentProficiency >= gapInfo.requiredProficiency) {
-        computedStatus = 'completed';
-        if (!item.completed_at) {
-          updateItemStatus.run('completed', new Date().toISOString(), item.id);
-        }
-      } else if (!gapInfo.prerequisitesMet) {
-        computedStatus = 'locked';
-        if (item.status !== 'locked') {
-          updateItemStatus.run('locked', null, item.id);
-        }
-      } else {
-        // Prerequisites met
-        if (item.status === 'locked') {
-          computedStatus = 'available';
-          updateItemStatus.run('available', null, item.id);
-        } else if (gapInfo.currentProficiency > 0 && item.status !== 'in_progress' && item.status !== 'completed') {
-          computedStatus = 'in_progress';
-          updateItemStatus.run('in_progress', null, item.id);
-        }
-      }
-    }
-
-    itemsView.push({
-      id: item.id,
-      skillId: item.skill_id,
-      skillName: item.skill_name,
-      phaseNumber: item.phase_number,
-      phaseTitle: item.phase_title,
-      title: item.title,
-      description: item.description,
-      status: computedStatus,
-      estimatedHours: item.estimated_hours,
-      orderIndex: item.order_index,
-      completedAt: item.completed_at,
-      prerequisitesMet: gapInfo ? gapInfo.prerequisitesMet : true,
-      missingPrerequisites: gapInfo ? gapInfo.missingPrerequisites : [],
-      resourcesCount: item.resource_count,
-      hasAssessment: item.assessment_count > 0
-    });
+  if (rawItems.length === 0) {
+    return [];
   }
 
-  // Update recalculation timestamp
-  db.prepare("UPDATE roadmaps SET recalculated_at = CURRENT_TIMESTAMP WHERE id = ?").run(roadmap.id);
-
-  // Group by phases
   const phaseMap = new Map<number, RoadmapItemView[]>();
-  for (const it of itemsView) {
-    if (!phaseMap.has(it.phaseNumber)) {
-      phaseMap.set(it.phaseNumber, []);
+  for (const it of rawItems) {
+    if (!phaseMap.has(it.phase_number)) {
+      phaseMap.set(it.phase_number, []);
     }
-    phaseMap.get(it.phaseNumber)!.push(it);
+    phaseMap.get(it.phase_number)!.push({
+      id: it.id,
+      skillId: it.skill_id,
+      skillName: it.skill_name,
+      phaseNumber: it.phase_number,
+      phaseTitle: it.phase_title,
+      title: it.title,
+      description: it.description,
+      status: it.status,
+      estimatedHours: it.estimated_hours,
+      orderIndex: it.order_index,
+      completedAt: it.completed_at,
+      prerequisitesMet: it.status !== 'locked',
+      missingPrerequisites: [],
+      resourcesCount: it.resource_count,
+      hasAssessment: it.assessment_count > 0
+    });
   }
 
   const phases: RoadmapPhase[] = [];
@@ -245,7 +347,9 @@ export function generateOrUpdateRoadmap(userId: number, careerId?: number): Road
     const pItems = phaseMap.get(pNum)!;
     const completed = pItems.filter(i => i.status === 'completed').length;
     const total = pItems.length;
-    const isUnlocked = prevPhaseComplete || pNum === 1 || pNum === 6; // Phase 1 & DSA track are always accessible
+
+    // Phase 1 is always unlocked. Next phases unlock if preceding phase is >= 60% complete or has unlocked items
+    const isUnlocked = pNum === 1 || prevPhaseComplete || pItems.some(i => i.status !== 'locked');
 
     phases.push({
       phaseNumber: pNum,
@@ -256,11 +360,93 @@ export function generateOrUpdateRoadmap(userId: number, careerId?: number): Road
       isUnlocked
     });
 
-    // A phase is complete if at least 70% of its required items are completed
-    prevPhaseComplete = total > 0 && (completed / total >= 0.7);
+    prevPhaseComplete = total > 0 && (completed / total >= 0.6);
   }
 
   return phases;
+}
+
+/**
+ * Helper to unlock subsequent phase items when preceding phase reaches completion threshold
+ */
+function unlockSubsequentItemsIfReady(roadmapId: number, completedPhaseNumber: number): void {
+  const currentPhaseItems = db.prepare(`
+    SELECT status FROM roadmap_items WHERE roadmap_id = ? AND phase_number = ?
+  `).all(roadmapId, completedPhaseNumber) as { status: string }[];
+
+  const completed = currentPhaseItems.filter(i => i.status === 'completed').length;
+  const total = currentPhaseItems.length;
+
+  if (total > 0 && completed / total >= 0.5) {
+    // Unlock first 2 locked items of next phase
+    const nextPhaseNumber = completedPhaseNumber + 1;
+    const lockedNext = db.prepare(`
+      SELECT id FROM roadmap_items
+      WHERE roadmap_id = ? AND phase_number = ? AND status = 'locked'
+      ORDER BY order_index ASC
+      LIMIT 2
+    `).all(roadmapId, nextPhaseNumber) as { id: number }[];
+
+    for (const item of lockedNext) {
+      db.prepare("UPDATE roadmap_items SET status = 'available' WHERE id = ?").run(item.id);
+    }
+  }
+}
+
+/**
+ * Returns contextual titles for phases based on career domain
+ */
+function getPhaseTitlesForCareer(careerTitle: string, numPhases: number): string[] {
+  const lower = careerTitle.toLowerCase();
+
+  if (lower.includes('full stack') || lower.includes('frontend') || lower.includes('backend') || lower.includes('web')) {
+    return [
+      'Phase 1: Web Fundamentals & Core Scripting',
+      'Phase 2: Modern Frontend & State Management',
+      'Phase 3: Backend Services & API Architecture',
+      'Phase 4: Database Systems & Authentication',
+      'Phase 5: Containerization, Testing & Deployment'
+    ].slice(0, numPhases);
+  }
+
+  if (lower.includes('ai') || lower.includes('machine learning') || lower.includes('data')) {
+    return [
+      'Phase 1: Programming & Math Bedrock',
+      'Phase 2: Data Wrangling & Feature Analysis',
+      'Phase 3: Machine Learning Models & Algorithms',
+      'Phase 4: Deep Learning & Neural Architectures',
+      'Phase 5: Generative AI, RAG & Production Deployment'
+    ].slice(0, numPhases);
+  }
+
+  if (lower.includes('cloud') || lower.includes('devops')) {
+    return [
+      'Phase 1: Linux & Scripting Foundations',
+      'Phase 2: Version Control & Networking',
+      'Phase 3: Containerization & CI/CD Pipelines',
+      'Phase 4: Cloud Architecture & Infrastructure as Code',
+      'Phase 5: Production Kubernetes & Observability'
+    ].slice(0, numPhases);
+  }
+
+  if (lower.includes('mobile') || lower.includes('android') || lower.includes('ios')) {
+    return [
+      'Phase 1: Language Fundamentals & SDK Setup',
+      'Phase 2: UI Components & Responsive Layouts',
+      'Phase 3: State Management & Offline Storage',
+      'Phase 4: REST API Integration & Native Device APIs',
+      'Phase 5: Performance Optimization & App Store Release'
+    ].slice(0, numPhases);
+  }
+
+  // Default professional engineering phases
+  return [
+    'Phase 1: Core Engineering Foundations',
+    'Phase 2: Domain Architecture & Tooling',
+    'Phase 3: Advanced Development & System Design',
+    'Phase 4: Data Systems, Security & Cloud',
+    'Phase 5: Production Capstone, Testing & Deployment'
+  ].slice(0, numPhases);
 }
 
 export interface PersonalizedPriorityTopic {
@@ -459,7 +645,7 @@ export function computePersonalizedPriorityTopics(params: {
   }
 
   // Sort topics by score descending (high priority gaps first)
-  topics.sort((a, b) => b.score - a.score);
+  topics.sort((b, a) => a.score - b.score);
 
   const priorityTopics = topics.slice(0, 10).map(({ score, ...rest }) => rest);
 

@@ -10,6 +10,7 @@ import {
   AnimatedProgressBar, MotionButton
 } from '../../components/common/AnimatedWrappers.js';
 import { RoadmapPhase, RoadmapItemView } from '../../types.js';
+import { apiFetch } from '../../lib/api.js';
 
 interface RoadmapPageProps {
   onNavigate: (path: string) => void;
@@ -19,25 +20,24 @@ export const RoadmapPage: React.FC<RoadmapPageProps> = ({ onNavigate }) => {
   const { showCelebration } = useNotifications();
   const [phases, setPhases] = useState<RoadmapPhase[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<'all' | 'pending' | 'completed'>('all');
   const [updatingId, setUpdatingId] = useState<number | null>(null);
   const [recalculating, setRecalculating] = useState(false);
 
-  const getHeaders = () => ({
-    Authorization: `Bearer ${localStorage.getItem('skillpath_token')}`,
-    'Content-Type': 'application/json'
-  });
-
   const loadRoadmap = async () => {
     try {
       setLoading(true);
-      const res = await fetch('/api/student/roadmap', { headers: getHeaders() });
-      if (res.ok) {
-        const data = await res.json();
-        setPhases(data.phases || []);
+      setError(null);
+      const res = await apiFetch<{ phases: RoadmapPhase[] }>('/api/student/roadmap');
+      if (res.ok && res.data?.phases) {
+        setPhases(res.data.phases);
+      } else {
+        setError(res.error || 'Failed to load roadmap.');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to load roadmap:', err);
+      setError(err?.message || 'Network error loading roadmap.');
     } finally {
       setLoading(false);
     }
@@ -50,14 +50,12 @@ export const RoadmapPage: React.FC<RoadmapPageProps> = ({ onNavigate }) => {
   const handleUpdateStatus = async (item: RoadmapItemView, newStatus: string) => {
     setUpdatingId(item.id);
     try {
-      const res = await fetch(`/api/student/roadmap/item/${item.id}/status`, {
+      const res = await apiFetch(`/api/student/roadmap/item/${item.id}/status`, {
         method: 'POST',
-        headers: getHeaders(),
         body: JSON.stringify({ status: newStatus })
       });
 
       if (res.ok) {
-        const data = await res.json();
         await loadRoadmap();
         if (newStatus === 'completed') {
           showCelebration(
@@ -77,13 +75,11 @@ export const RoadmapPage: React.FC<RoadmapPageProps> = ({ onNavigate }) => {
   const handleManualRecalculate = async () => {
     setRecalculating(true);
     try {
-      const res = await fetch('/api/student/roadmap/recalculate', {
-        method: 'POST',
-        headers: getHeaders()
+      const res = await apiFetch<{ phases: RoadmapPhase[] }>('/api/student/roadmap/recalculate', {
+        method: 'POST'
       });
-      if (res.ok) {
-        const data = await res.json();
-        setPhases(data.phases || []);
+      if (res.ok && res.data?.phases) {
+        setPhases(res.data.phases);
         showCelebration('Roadmap Recalculated', 'All dependencies, prerequisites, and milestone statuses have been refreshed.');
       }
     } catch (err) {
@@ -153,9 +149,37 @@ export const RoadmapPage: React.FC<RoadmapPageProps> = ({ onNavigate }) => {
         </div>
       </CardReveal>
 
-      {/* Vertical Phases List with Stagger */}
+      {/* Vertical Phases List */}
       {loading ? (
         <div className="py-20 text-center text-xs text-slate-400">Computing dynamic roadmap...</div>
+      ) : error ? (
+        <CardReveal className="rounded-2xl border border-red-900/40 bg-red-950/20 p-6 sm:p-8 text-center backdrop-blur-sm">
+          <AlertCircle className="mx-auto h-8 w-8 text-red-400 mb-2" />
+          <h3 className="text-sm font-semibold text-white">Could not load roadmap</h3>
+          <p className="text-xs text-slate-400 mt-1 max-w-md mx-auto">{error}</p>
+          <MotionButton
+            onClick={loadRoadmap}
+            className="mt-4 px-4 py-2 text-xs font-semibold bg-red-600 hover:bg-red-500 text-white rounded-xl cursor-pointer"
+          >
+            Retry Connection
+          </MotionButton>
+        </CardReveal>
+      ) : phases.length === 0 ? (
+        <CardReveal className="rounded-2xl border border-slate-800 bg-slate-900/60 p-8 text-center backdrop-blur-sm">
+          <Map className="mx-auto h-10 w-10 text-blue-400 mb-3 opacity-80" />
+          <h3 className="text-base font-bold text-white">Initializing Your Personalized Roadmap</h3>
+          <p className="text-xs text-slate-400 mt-1 max-w-md mx-auto">
+            Configuring milestones based on your career goal, academic background, and skills.
+          </p>
+          <MotionButton
+            onClick={handleManualRecalculate}
+            disabled={recalculating}
+            className="mt-5 inline-flex items-center gap-2 rounded-xl bg-blue-600 px-5 py-2.5 text-xs font-semibold text-white hover:bg-blue-500 cursor-pointer shadow-lg shadow-blue-500/20"
+          >
+            <Sparkles className="h-4 w-4" />
+            <span>Generate Roadmap Now</span>
+          </MotionButton>
+        </CardReveal>
       ) : (
         <div className="space-y-6 sm:space-y-8">
           {phases.map((phase, pIdx) => {

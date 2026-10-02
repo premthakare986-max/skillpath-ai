@@ -39,11 +39,36 @@ if (isVercel && !fs.existsSync(dbPath)) {
   }
 }
 
-const rawDb = new DatabaseSync(dbPath);
+// Create and verify database connection with self-healing auto-recovery
+function initDatabaseConnection(): DatabaseSync {
+  function tryConnect(): DatabaseSync {
+    const raw = new DatabaseSync(dbPath);
+    raw.exec('PRAGMA journal_mode = WAL;');
+    raw.exec('PRAGMA foreign_keys = ON;');
+    // Verify integrity immediately
+    const check = raw.prepare('PRAGMA integrity_check;').all() as any[];
+    if (check.length > 0 && check[0]?.integrity_check !== 'ok') {
+      throw new Error(`Integrity check failed: ${JSON.stringify(check)}`);
+    }
+    return raw;
+  }
 
-// Enable WAL mode & foreign keys for robust concurrency
-rawDb.exec('PRAGMA journal_mode = WAL;');
-rawDb.exec('PRAGMA foreign_keys = ON;');
+  try {
+    return tryConnect();
+  } catch (err: any) {
+    console.warn('[SkillPath AI] Corrupted or orphaned database files detected. Auto-recovering SQLite database...', err?.message || err);
+    try {
+      if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+      if (fs.existsSync(`${dbPath}-wal`)) fs.unlinkSync(`${dbPath}-wal`);
+      if (fs.existsSync(`${dbPath}-shm`)) fs.unlinkSync(`${dbPath}-shm`);
+    } catch (cleanErr) {
+      console.warn('[SkillPath AI] File cleanup warning:', cleanErr);
+    }
+    return tryConnect();
+  }
+}
+
+const rawDb = initDatabaseConnection();
 
 // Helper to convert undefined values to null for SQLite parameter binding
 function sanitizeParam(val: any): any {

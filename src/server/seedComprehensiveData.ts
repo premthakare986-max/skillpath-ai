@@ -307,6 +307,7 @@ export function seedComprehensiveCareersAndSkills() {
     'data-engineer': ['Python', 'SQL', 'PostgreSQL', 'MySQL', 'MongoDB', 'Docker', 'Linux', 'CI/CD', 'Git & GitHub', 'Data Structures'],
     'cloud-engineer': ['Linux', 'Cloud Fundamentals', 'Docker', 'CI/CD', 'Git & GitHub', 'Python', 'Go', 'REST APIs', 'SQL'],
     'devops-engineer': ['Linux', 'Docker', 'CI/CD', 'Git & GitHub', 'Cloud Fundamentals', 'Python', 'Go', 'REST APIs'],
+    'cloud-devops': ['Linux', 'Cloud Fundamentals', 'Docker', 'CI/CD', 'Git & GitHub', 'Python', 'Go', 'REST APIs', 'SQL'],
     'cybersecurity-engineer': ['Linux', 'Python', 'Cloud Fundamentals', 'SQL', 'Git & GitHub', 'C', 'REST APIs'],
     'mobile-developer': ['JavaScript', 'TypeScript', 'React', 'REST APIs', 'Git & GitHub', 'HTML5', 'CSS3', 'Tailwind CSS'],
     'android-developer': ['Java', 'Object-Oriented Programming', 'Data Structures', 'REST APIs', 'Git & GitHub', 'SQL'],
